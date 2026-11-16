@@ -1,0 +1,257 @@
+name: Upstream bump
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Upstream commit to pin (default: head of the upstream default branch)'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild and force-push the bump branch even if its PR is already open'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream
+        id: upstream
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          repo=$(sed -n 's/^UPSTREAM_REPO=//p' build.sh)
+          old=$(sed -n 's/^UPSTREAM_COMMIT=//p' build.sh)
+          tag=$(sed -n 's/^TAG=//p' build.sh)
+          if [ -n "$INPUT_COMMIT" ]; then
+            new=$(git ls-remote "$repo" | awk -v c="$INPUT_COMMIT" '$1 ~ "^"c { print $1; exit }')
+            [ -n "$new" ] || new="$INPUT_COMMIT"
+          else
+            new=$(git ls-remote "$repo" HEAD | cut -f1)
+          fi
+          if ! [[ "$new" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve upstream commit '${INPUT_COMMIT:-HEAD}'"
+            exit 1
+          fi
+          short=${new:0:12}
+          branch="bump/upstream-$short"
+          web=${repo%.git}
+          {
+            echo "repo=$repo"
+            echo "web=$web"
+            echo "old=$old"
+            echo "new=$new"
+            echo "short=$short"
+            echo "branch=$branch"
+            echo "version=$((tag + 1))"
+          } >> "$GITHUB_OUTPUT"
+          skip=false
+          if [ "$new" = "$old" ]; then
+            echo "Upstream is still at the pinned commit $old." | tee -a "$GITHUB_STEP_SUMMARY"
+            skip=true
+          else
+            pr=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
+            if [ -n "$pr" ] && [ "$FORCE" != true ]; then
+              echo "A PR for upstream $short is already open: $pr" | tee -a "$GITHUB_STEP_SUMMARY"
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - name: Update pins
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          OLD: ${{ steps.upstream.outputs.old }}
+          NEW: ${{ steps.upstream.outputs.new }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          git checkout --quiet -B "$BRANCH"
+          old_tag=$((VERSION - 1))
+          sed -i "s/^UPSTREAM_COMMIT=$OLD\$/UPSTREAM_COMMIT=$NEW/; s/^TAG=$old_tag\$/TAG=$VERSION/" build.sh
+          sed -i "s/^const tag = \"$old_tag\"\$/const tag = \"$VERSION\"/" bindings/torrserver.go
+          grep -qx "UPSTREAM_COMMIT=$NEW" build.sh
+          grep -qx "TAG=$VERSION" build.sh
+          grep -qx "const tag = \"$VERSION\"" bindings/torrserver.go
+          git diff
+
+      - name: Check patches
+        id: patches
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          NEW: ${{ steps.upstream.outputs.new }}
+        run: |
+          if scripts/check-patches.sh "$NEW" "$RUNNER_TEMP/patches.md"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$RUNNER_TEMP/patches.md"
+
+      - name: Toolchain
+        if: steps.upstream.outputs.skip == 'false' && steps.patches.outputs.ok == 'true'
+        uses: ./.github/actions/toolchain
+
+      - name: Smoke tests
+        id: tests
+        if: steps.upstream.outputs.skip == 'false' && steps.patches.outputs.ok == 'true'
+        run: |
+          set -o pipefail
+          if ./build.sh test -v 2>&1 | tee "$RUNNER_TEMP/test.log"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build engine
+        id: build
+        if: steps.upstream.outputs.skip == 'false' && steps.patches.outputs.ok == 'true'
+        run: |
+          set -o pipefail
+          if ./build.sh "$RUNNER_TEMP/engine-out" 2>&1 | tee "$RUNNER_TEMP/build.log"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update PR
+        if: steps.upstream.outputs.skip == 'false'
+        env:
+          WEB: ${{ steps.upstream.outputs.web }}
+          OLD: ${{ steps.upstream.outputs.old }}
+          NEW: ${{ steps.upstream.outputs.new }}
+          SHORT: ${{ steps.upstream.outputs.short }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          PATCHES_OK: ${{ steps.patches.outputs.ok }}
+          TESTS_OK: ${{ steps.tests.outputs.ok }}
+          BUILD_OK: ${{ steps.build.outputs.ok }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          result() {
+            case "$1" in
+              true) echo "passed" ;;
+              false) echo "**failed**" ;;
+              *) echo "not run" ;;
+            esac
+          }
+          ok=true
+          [ "$PATCHES_OK" = true ] && [ "$TESTS_OK" = true ] && [ "$BUILD_OK" = true ] || ok=false
+          sums="$RUNNER_TEMP/engine-out/sha256.txt"
+          body="$RUNNER_TEMP/pr.md"
+          {
+            if [ "$ok" = true ]; then
+              echo "Upstream bump to \`$SHORT\`, engine version $VERSION. Patches, smoke tests and build passed."
+            else
+              echo "> [!CAUTION]"
+              echo "> **This bump is failing.** Fix the patches or the bindings on this branch before merging."
+            fi
+            echo
+            echo "Upstream: $WEB/compare/$OLD...$NEW"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Patches | $(result "$PATCHES_OK") |"
+            echo "| Smoke tests | $(result "$TESTS_OK") |"
+            echo "| Build | $(result "$BUILD_OK") |"
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "### Patches"
+            echo
+            cat "$RUNNER_TEMP/patches.md"
+            echo
+            if [ -f "$RUNNER_TEMP/test.log" ]; then
+              echo "### Smoke tests"
+              echo
+              echo '```'
+              grep -E '^(--- |PASS|FAIL|ok |panic:)|_test\.go:[0-9]+:' "$RUNNER_TEMP/test.log" | head -n 200 || echo "no test output"
+              echo '```'
+              echo
+            fi
+            if [ "$BUILD_OK" = true ] && [ -f "$sums" ]; then
+              echo "### Build"
+              echo
+              echo '```'
+              grep -E '^(go|gomobile|upstream|javac|d8|version): |libgojni.so [0-9]+ bytes' "$RUNNER_TEMP/build.log"
+              echo
+              cat "$sums"
+              echo '```'
+              echo
+              echo "### EngineSource.kt"
+              echo
+              echo "Pinned automatically by the release workflow when \`PROVIDER_REPO_TOKEN\` is set. These are this run's hashes; the release build is the source of truth."
+              echo
+              echo '```kotlin'
+              echo "    const val VERSION = \"$VERSION\""
+              echo
+              echo "    const val DEX_SHA256 = \"$(awk '$2 == "classes.dex" { print $1 }' "$sums")\""
+              echo
+              echo "    val LIBRARY_SHA256 = linkedMapOf("
+              for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+                echo "        \"$abi\" to \"$(awk -v f="jni/$abi/libgojni.so" '$2 == f { print $1 }' "$sums")\","
+              done
+              echo "    )"
+              echo '```'
+              echo
+            elif [ "$BUILD_OK" = false ]; then
+              echo "### Build log (tail)"
+              echo
+              echo '```'
+              tail -n 60 "$RUNNER_TEMP/build.log"
+              echo '```'
+              echo
+            fi
+            echo "After merging: tag the merge commit \`v$VERSION\` and push the tag to release."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          git add build.sh bindings/torrserver.go
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "chore: bump upstream to $SHORT, engine $VERSION"
+          git push --quiet --force origin "$BRANCH"
+
+          title="Bump upstream to $SHORT (engine $VERSION)"
+          [ "$ok" = true ] || title="[FAILING] $title"
+          pr=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "$title" --body-file "$body"
+            if [ "$ok" = true ]; then gh pr ready "$pr" || true; else gh pr ready "$pr" --undo || true; fi
+          else
+            draft=()
+            [ "$ok" = true ] || draft=(--draft)
+            base=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+            pr=$(gh pr create --base "$base" --head "$BRANCH" \
+              --title "$title" --body-file "$body" "${draft[@]}")
+          fi
+          echo "PR: $pr" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bump/upstream-\")) | select(.headRefName != \"$BRANCH\") | .number" |
+            while read -r old_pr; do
+              gh pr close "$old_pr" --comment "Superseded by $pr."
+            done
+
+          [ "$ok" = true ] || { echo "::error::upstream bump to $SHORT is failing, see $pr"; exit 1; }
