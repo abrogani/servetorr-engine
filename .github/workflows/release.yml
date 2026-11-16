@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Engine version (TAG in build.sh), released as v<version>'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ABIS: 'arm64-v8a armeabi-v7a x86 x86_64'
+      PROVIDER_REPO: abrogani/automatic-sniffle
+      ENGINE_SOURCE: providers/ServeTorr/src/main/kotlin/com/abrogani/servetorr/engine/EngineSource.kt
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            version="$INPUT_VERSION"
+          else
+            version="${REF_NAME#v}"
+          fi
+          if ! [[ "$version" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::engine version must be a positive integer, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v5.0.0
+
+      - name: Check tag target
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          target=$(git ls-remote origin "refs/tags/$TAG^{}" | cut -f1)
+          [ -n "$target" ] || target=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          head=$(git rev-parse HEAD)
+          if [ -n "$target" ] && [ "$target" != "$head" ]; then
+            echo "::error::$TAG points at $target but this run checked out $head. Run the workflow from the tag."
+            exit 1
+          fi
+
+      - name: Check version constants
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          fail=0
+          grep -qx "TAG=$VERSION" build.sh || { echo "::error file=build.sh::TAG is not $VERSION"; fail=1; }
+          grep -qx "const tag = \"$VERSION\"" bindings/torrserver.go || { echo "::error file=bindings/torrserver.go::const tag is not \"$VERSION\""; fail=1; }
+          exit $fail
+
+      - name: Toolchain
+        uses: ./.github/actions/toolchain
+
+      - name: Smoke tests
+        run: |
+          set -o pipefail
+          ./build.sh test -v 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Test summary
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || exit 0
+          {
+            echo "### Smoke tests"
+            echo
+            echo '```'
+            grep -E '^(--- |PASS|FAIL|ok |panic:)|_test\.go:[0-9]+:' "$RUNNER_TEMP/test.log" || echo "no test output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build engine
+        run: |
+          set -o pipefail
+          ./build.sh "$RUNNER_TEMP/engine-out" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Check hashes
+        run: |
+          out="$RUNNER_TEMP/engine-out"
+          aar="$RUNNER_TEMP/aar"
+          actual="$RUNNER_TEMP/actual.txt"
+          rm -rf "$aar" && mkdir -p "$aar"
+          unzip -q "$out/torrserver.aar" -d "$aar"
+          (cd "$aar" && for abi in $ABIS; do sha256sum "jni/$abi/libgojni.so"; done; sha256sum classes.dex) > "$actual"
+          diff -u "$out/sha256.txt" "$actual" || { echo "::error::build.sh sha256.txt does not match the aar contents"; exit 1; }
+
+      - name: EngineSource block
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sums="$RUNNER_TEMP/engine-out/sha256.txt"
+          {
+            echo "### EngineSource.kt for engine $VERSION"
+            echo
+            echo '```kotlin'
+            echo "    const val VERSION = \"$VERSION\""
+            echo
+            echo "    const val DEX_SHA256 = \"$(awk '$2 == "classes.dex" { print $1 }' "$sums")\""
+            echo
+            echo "    val LIBRARY_SHA256 = linkedMapOf("
+            for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+              echo "        \"$abi\" to \"$(awk -v f="jni/$abi/libgojni.so" '$2 == f { print $1 }' "$sums")\","
+            done
+            echo "    )"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out="$RUNNER_TEMP/engine-out"
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "ServeTorr engine $VERSION, a gomobile build of YouROK/TorrServer (GPL-3.0)."
+            echo
+            echo '```'
+            grep -E '^(go|gomobile|upstream|javac|d8|version): ' "$RUNNER_TEMP/build.log"
+            echo
+            cat "$out/sha256.txt"
+            (cd "$out" && sha256sum torrserver.aar)
+            echo '```'
+          } > "$notes"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$out/torrserver.aar" "$out/sha256.txt" --clobber
+            gh release edit "$TAG" --notes-file "$notes"
+          else
+            gh release create "$TAG" "$out/torrserver.aar" "$out/sha256.txt" --target "$GITHUB_SHA" \
+              --title "ServeTorr engine $VERSION" --notes-file "$notes"
+          fi
+
+      - name: Open provider PR
+        env:
+          PROVIDER_TOKEN: ${{ secrets.PROVIDER_REPO_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ -z "$PROVIDER_TOKEN" ]; then
+            echo "::notice::PROVIDER_REPO_TOKEN is not set; skipping the provider PR. Paste the EngineSource block above into $PROVIDER_REPO by hand."
+            {
+              echo
+              echo "Provider PR skipped: the \`PROVIDER_REPO_TOKEN\` secret is not set."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          export GH_TOKEN="$PROVIDER_TOKEN"
+          branch="servetorr-engine-v$VERSION"
+          dir="$RUNNER_TEMP/provider"
+          git clone --quiet --depth 1 "https://x-access-token:$PROVIDER_TOKEN@github.com/$PROVIDER_REPO.git" "$dir"
+          cd "$dir"
+          base=$(git rev-parse --abbrev-ref HEAD)
+          git checkout --quiet -B "$branch"
+          "$GITHUB_WORKSPACE/scripts/update-engine-source.sh" "$ENGINE_SOURCE" "$VERSION" "$RUNNER_TEMP/engine-out/sha256.txt"
+          if git diff --quiet; then
+            echo "EngineSource.kt already pins engine $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git diff --stat
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -am "chore(servetorr): engine $VERSION"
+          git push --quiet --force origin "$branch"
+          body="$RUNNER_TEMP/provider-pr.md"
+          {
+            echo "Pins ServeTorr engine $VERSION: https://github.com/$REPOSITORY/releases/tag/$TAG"
+            echo
+            echo "Updates \`VERSION\`, \`DEX_SHA256\` and \`LIBRARY_SHA256\` in \`EngineSource.kt\`. \`AAR_URL\` follows \`VERSION\`."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/engine-out/sha256.txt"
+            echo '```'
+          } > "$body"
+          pr=$(gh pr list --repo "$PROVIDER_REPO" --head "$branch" --state open --json url --jq '.[0].url')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body-file "$body"
+          else
+            pr=$(gh pr create --repo "$PROVIDER_REPO" --base "$base" --head "$branch" \
+              --title "ServeTorr engine $VERSION" --body-file "$body")
+          fi
+          echo "Provider PR: $pr" | tee -a "$GITHUB_STEP_SUMMARY"

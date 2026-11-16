@@ -1,0 +1,34 @@
+name: Engine toolchain
+description: Go, JDK, Android SDK, NDK and build tools pinned for build.sh
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@v6.0.0
+      with:
+        go-version: '1.27.4'
+        cache: false
+
+    - name: Setup JDK
+      uses: actions/setup-java@v5.0.0
+      with:
+        distribution: temurin
+        java-version: '25.0.2'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4.0.4
+
+    - name: Install NDK and build tools
+      shell: bash
+      env:
+        NDK_VERSION: '28.2.13676358'
+        BUILD_TOOLS: '36.1.0'
+        PLATFORM: 'android-36'
+      run: |
+        yes | sdkmanager --licenses > /dev/null || true
+        sdkmanager --install "ndk;$NDK_VERSION" "build-tools;$BUILD_TOOLS" "platforms;$PLATFORM" > /dev/null
+        echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+        echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+        go version
+        javac -version
