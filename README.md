@@ -13,7 +13,7 @@ Licensed under GPL-3.0 (see `LICENSE`), like upstream TorrServer, which this is 
 | `bindings/` | The `torrServer` gomobile package (`torrserver.go`), its `go.mod`/`go.sum`, and the smoke tests. |
 | `patches/` | Patches applied to the upstream checkout (`upstream-*.patch`) and to the gobind-generated Java. |
 | `build.sh` | Pins (upstream commit, Go, gomobile, Android API, build tools) and the build. `build.sh test` runs the smoke tests. |
-| `scripts/` | `check-patches.sh` (per-patch apply report) and `update-engine-source.sh` (rewrites the provider's pins). |
+| `scripts/` | `check-patches.sh` (per-patch apply report), `update-engine-source.sh` (rewrites the provider's pins) and `bump-provider-version.sh` (bumps the provider's `versionPatch` and changelog). |
 | `.github/` | `release.yml`, `upstream-bump.yml` and the shared toolchain action. |
 
 ## Upstream
@@ -96,9 +96,12 @@ Bump it for any change that changes the binary: upstream commit, patches, bindin
    publishes release `v<VERSION>` with `torrserver.aar` and `sha256.txt`. The job summary has the test results and the
    `EngineSource` block.
 4. If `PROVIDER_REPO_TOKEN` is set, it opens (or updates) a PR on `abrogani/automatic-sniffle` from branch
-   `servetorr-engine-v<VERSION>` that changes only `VERSION`, `DEX_SHA256` and `LIBRARY_SHA256` in `EngineSource.kt`
-   (`scripts/update-engine-source.sh`: exact-line replacement, fails if the file's shape changed). Without the
-   secret the step is skipped with a notice; paste the block from the summary by hand.
+   `servetorr-engine-v<VERSION>`, cut from the provider repo's current default branch. It changes `VERSION`,
+   `DEX_SHA256` and `LIBRARY_SHA256` in `EngineSource.kt` (`scripts/update-engine-source.sh`) and bumps the provider's
+   `versionPatch` with a changelog entry (`scripts/bump-provider-version.sh`). The provider pins the engine, so users
+   only get a new engine through a new provider build, and the host only offers that when the version code goes up.
+   Both scripts do exact-line edits and fail if the file's shape changed. Without the secret the step is skipped with
+   a notice; paste the block from the summary and bump the provider version by hand.
 
 **The CI (Linux) build is the source of truth** for the pinned hashes.
 

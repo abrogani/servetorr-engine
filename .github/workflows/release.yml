@@ -26,6 +26,7 @@ jobs:
       ABIS: 'arm64-v8a armeabi-v7a x86 x86_64'
       PROVIDER_REPO: abrogani/automatic-sniffle
       ENGINE_SOURCE: providers/ServeTorr/src/main/kotlin/com/abrogani/servetorr/engine/EngineSource.kt
+      PROVIDER_GRADLE: providers/ServeTorr/build.gradle.kts
     steps:
       - name: Resolve version
         id: version
@@ -180,9 +181,10 @@ jobs:
             echo "EngineSource.kt already pins engine $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          provider_version=$("$GITHUB_WORKSPACE/scripts/bump-provider-version.sh" "$PROVIDER_GRADLE" "$VERSION")
           git diff --stat
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit --quiet -am "chore(servetorr): engine $VERSION"
+            commit --quiet -am "chore(servetorr): engine $VERSION, provider $provider_version"
           git push --quiet --force origin "$branch"
           body="$RUNNER_TEMP/provider-pr.md"
           {
@@ -190,15 +192,17 @@ jobs:
             echo
             echo "Updates \`VERSION\`, \`DEX_SHA256\` and \`LIBRARY_SHA256\` in \`EngineSource.kt\`. \`AAR_URL\` follows \`VERSION\`."
             echo
+            echo "Bumps the provider to v$provider_version (versionPatch, with a changelog entry) so the host offers the update once this is merged and built."
+            echo
             echo '```'
             cat "$RUNNER_TEMP/engine-out/sha256.txt"
             echo '```'
           } > "$body"
           pr=$(gh pr list --repo "$PROVIDER_REPO" --head "$branch" --state open --json url --jq '.[0].url')
           if [ -n "$pr" ]; then
-            gh pr edit "$pr" --body-file "$body"
+            gh pr edit "$pr" --title "ServeTorr engine $VERSION (provider v$provider_version)" --body-file "$body"
           else
             pr=$(gh pr create --repo "$PROVIDER_REPO" --base "$base" --head "$branch" \
-              --title "ServeTorr engine $VERSION" --body-file "$body")
+              --title "ServeTorr engine $VERSION (provider v$provider_version)" --body-file "$body")
           fi
           echo "Provider PR: $pr" | tee -a "$GITHUB_STEP_SUMMARY"
