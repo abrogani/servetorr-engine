@@ -12,10 +12,6 @@ PLATFORM=android-36
 ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-OUT=$(mkdir -p "${1:-$HERE/build}" && cd "${1:-$HERE/build}" && pwd)
-: "${ANDROID_HOME:?set ANDROID_HOME}"
-: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME}"
-ANDROID_JAR="$ANDROID_HOME/platforms/$PLATFORM/android.jar"
 
 export GOTOOLCHAIN=$GO_TOOLCHAIN
 export GOFLAGS=-mod=readonly
@@ -23,6 +19,35 @@ export CGO_ENABLED=1
 export TZ=UTC
 export LC_ALL=C
 umask 022
+
+grep -q "const tag = \"$TAG\"" "$HERE/bindings/torrserver.go" || { echo "bindings/torrserver.go tag is not $TAG" >&2; exit 1; }
+
+prepare() {
+  rm -rf "$WORK"
+  mkdir -p "$WORK/bin"
+  git clone --quiet "$UPSTREAM_REPO" "$SRC"
+  git -C "$SRC" checkout --quiet "$UPSTREAM_COMMIT"
+  git -C "$SRC" apply "$HERE"/patches/upstream-*.patch
+  mkdir -p "$MODULE"
+  cp "$HERE"/bindings/torrserver.go "$HERE"/bindings/go.mod "$HERE"/bindings/go.sum "$MODULE/"
+}
+
+if [ "${1:-}" = test ]; then
+  shift
+  WORK=/tmp/servetorr-engine-test
+  SRC="$WORK/src"
+  MODULE="$SRC/server/mobile/servetorr"
+  prepare
+  cp "$HERE"/bindings/*_test.go "$MODULE/"
+  cd "$MODULE"
+  go version
+  exec go test -tags servetorr -ldflags=-checklinkname=0 -count=1 "$@" ./...
+fi
+
+OUT=$(mkdir -p "${1:-$HERE/build}" && cd "${1:-$HERE/build}" && pwd)
+: "${ANDROID_HOME:?set ANDROID_HOME}"
+: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME}"
+ANDROID_JAR="$ANDROID_HOME/platforms/$PLATFORM/android.jar"
 
 sha256() {
   if command -v sha256sum > /dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi
@@ -32,20 +57,13 @@ WORK=/tmp/servetorr-engine
 SRC="$WORK/src"
 MODULE="$SRC/server/mobile/servetorr"
 STAGE="$OUT/stage"
-rm -rf "$WORK" "$STAGE" "$OUT/torrserver.aar" "$OUT/sha256.txt"
-mkdir -p "$WORK/bin" "$STAGE"
+rm -rf "$STAGE" "$OUT/torrserver.aar" "$OUT/sha256.txt"
+mkdir -p "$STAGE"
+prepare
 export PATH="$WORK/bin:$PATH"
-
-grep -q "const tag = \"$TAG\"" "$HERE/bindings/torrserver.go" || { echo "bindings/torrserver.go tag is not $TAG" >&2; exit 1; }
 
 GOBIN="$WORK/bin" go install "golang.org/x/mobile/cmd/gomobile@$MOBILE_VERSION" "golang.org/x/mobile/cmd/gobind@$MOBILE_VERSION"
 gomobile init
-
-git clone --quiet "$UPSTREAM_REPO" "$SRC"
-git -C "$SRC" checkout --quiet "$UPSTREAM_COMMIT"
-git -C "$SRC" apply "$HERE"/patches/upstream-*.patch
-mkdir -p "$MODULE"
-cp "$HERE"/bindings/torrserver.go "$HERE"/bindings/go.mod "$HERE"/bindings/go.sum "$MODULE/"
 
 (cd "$MODULE" && gomobile bind -target=android -androidapi "$ANDROID_API" -tags servetorr -trimpath \
   -ldflags "-s -w -checklinkname=0 -buildid=" -o "$STAGE/gomobile.aar" .)
