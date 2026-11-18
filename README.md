@@ -89,7 +89,7 @@ Bump it for any change that changes the binary: upstream commit, patches, bindin
 
 ## Release
 
-1. Bump `TAG` and `const tag` (the upstream bump PR does this), merge to `main`.
+1. Bump `TAG` and `const tag` (the upstream bump does this and the following steps automatically), merge to `main`.
 2. Tag the commit `v<VERSION>` and push the tag (or run **Release** manually with the version; it refuses to run if
    the tag exists and points elsewhere).
 3. `release.yml` checks the version constants, runs the smoke tests, builds, checks `sha256.txt` against the AAR, and
@@ -107,27 +107,24 @@ Bump it for any change that changes the binary: upstream commit, patches, bindin
 
 ## Upstream updates
 
-`upstream-bump.yml` runs daily (and manually, optionally with a specific upstream `commit` and `force`).
+`upstream-bump.yml` runs daily (and manually, optionally with a specific upstream `commit`). It makes no PR; it
+releases directly.
 
 - It tracks the **head of upstream's default branch**, not releases: our pin and patches are against that branch, and
   upstream's tags mix lineages (`MatriX.*`, `Silo.*`) that our patches don't apply to.
-- If the head differs from `UPSTREAM_COMMIT`, it creates `bump/upstream-<12-char sha>`, updates the pin, bumps
-  `TAG`/`const tag` by one, reports each patch (with the `git apply --reject` output for failures), runs the smoke
-  tests and the build, commits, and opens a PR. The PR body has the upstream compare link, patch/test/build results,
-  the new hashes and the `EngineSource` block.
-- A failing bump still opens the PR, as a draft titled `[FAILING] …`, and the job fails. Fix the patches on that
-  branch.
-- No duplicates: if an open PR for that branch exists, the run is skipped (`force` rebuilds and force-pushes the branch,
-  overwriting any commits on it, and updates the PR). Older open `bump/upstream-*` PRs are closed as superseded (their
-  branches are kept).
-- PRs opened with `GITHUB_TOKEN` don't trigger other workflows; that's why all checks run in this job and land in the
-  PR body. Nothing else needs to run on the PR.
+- If the head differs from `UPSTREAM_COMMIT`, it updates the pin, sets `TAG`/`const tag` to the latest `v*` tag + 1,
+  reports each patch (with the `git apply --reject` output for failures) and runs the smoke tests.
+- If everything passes, it commits to the default branch, pushes an annotated `v<VERSION>` tag (atomically with the
+  commit) and dispatches **Release** on that tag. Pushes made with `GITHUB_TOKEN` don't trigger other workflows, hence
+  the explicit dispatch.
+- If patches or tests fail, nothing is committed or tagged and the job fails. Fix it by hand and release as above.
+- The default branch must accept pushes from `github-actions[bot]` (no branch protection blocking it).
 
 ## Secrets and settings
 
 | Name | Used by | Notes |
 |---|---|---|
-| `GITHUB_TOKEN` | both workflows | Built in. Enable *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests* for the bump PRs. |
+| `GITHUB_TOKEN` | both workflows | Built in. The bump workflow needs `contents` and `actions` write. |
 | `PROVIDER_REPO_TOKEN` | `release.yml` | Optional. Fine-grained PAT with *Contents* and *Pull requests* read/write on `abrogani/automatic-sniffle`. |
 
 ## How the provider consumes it
