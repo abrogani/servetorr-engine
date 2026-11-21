@@ -22,7 +22,7 @@ import (
 	"server/web/api"
 )
 
-const tag = "3"
+const tag = "4"
 
 const loopback = "127.0.0.1"
 
